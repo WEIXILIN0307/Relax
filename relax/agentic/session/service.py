@@ -20,6 +20,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Tupl
 from uuid import uuid4
 
 import httpx
+import numpy as np
 import ray
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -64,6 +65,7 @@ from relax.agentic.session.state import (
     _messages_tools_template_state_hash,
     _multimodal_inputs_from_messages,
     check_messages,
+    merge_routed_experts,
     normalize_template_kwargs,
     normalize_tools,
 )
@@ -278,7 +280,7 @@ def _decode_routed_experts(
     token_count: int,
 ) -> Any:
     encoded = meta_info.get("routed_experts")
-    if not encoded or token_count <= 1:
+    if encoded is None:
         return None
     import numpy as np
     import pybase64
@@ -1477,6 +1479,13 @@ class AgenticSessionShard:
             resolve_chat_api_base_url(),
         )
 
+    async def set_router_address(self, router_ip: str, router_port: int) -> None:
+        """Bind the ready managed router before any Session is launched."""
+        endpoint = (self.args.sglang_router_ip, self.args.sglang_router_port)
+        if endpoint[0] is not None and endpoint != (router_ip, router_port):
+            raise RuntimeError("Cannot replace a SessionShard router within its lifecycle")
+        self.args.sglang_router_ip, self.args.sglang_router_port = router_ip, router_port
+
     def _notify_state_change(self, group: Optional[ResidentGroup] = None) -> None:
         """Advance the Shard event cursor after owned refs change."""
 
@@ -2433,6 +2442,7 @@ class AgenticSessionShard:
                                 audio_data=ir.history_backend_audio_data,
                                 video_data=ir.history_backend_video_data,
                                 return_logprob=group.rollout_mode == "train" or ir.logprobs,
+                                collect_score_centering=group.rollout_mode == "train",
                                 fail_fast_no_workers=router_recovery_enabled,
                             )
                         except httpx.HTTPStatusError as error:
@@ -2572,13 +2582,23 @@ class AgenticSessionShard:
 
         ir.pending_token_delta.extend(result.new_tokens)
         ir.pending_logprob_delta.extend(result.new_log_probs)
+        if getattr(result, "new_topk_token_ids", None) is not None:
+            ir.pending_topk_token_ids_delta.append(result.new_topk_token_ids)
+            ir.pending_topk_logprob_delta.append(result.new_topk_log_probs)
         ir.pending_generation_elapsed_s += result.elapsed
         ir.latest_backend_meta = dict(result.meta_info)
         self._accumulate_request_meta(ir, meta_info=result.meta_info)
-        ir.pending_routed_experts = _decode_routed_experts(
+        routed_experts = _decode_routed_experts(
             args=self.args,
             meta_info=result.meta_info,
             token_count=len(ir.history_train_token_prefix) + len(ir.pending_token_delta),
+        )
+        if getattr(self.args, "use_rollout_routing_replay", False) and result.new_tokens and routed_experts is None:
+            raise ValueError("Backend omitted routed experts for newly accepted tokens")
+        ir.pending_routed_experts = merge_routed_experts(
+            ir.pending_routed_experts,
+            routed_experts,
+            expected_rows=max(0, len(ir.history_train_token_prefix) + len(ir.pending_token_delta) - 1),
         )
 
     def _terminal_response_locked(
@@ -2614,6 +2634,12 @@ class AgenticSessionShard:
             messages_delta=response_messages,
             token_delta=ir.pending_token_delta,
             logprob_delta=ir.pending_logprob_delta,
+            topk_token_ids_delta=np.concatenate(ir.pending_topk_token_ids_delta)
+            if ir.pending_topk_token_ids_delta
+            else None,
+            topk_logprob_delta=np.concatenate(ir.pending_topk_logprob_delta)
+            if ir.pending_topk_logprob_delta
+            else None,
             weight_version_delta=ir.pending_weight_version_delta,
             spec_delta=ir.pending_spec_delta,
             spec_counts=ir.pending_spec_counts,
@@ -3284,11 +3310,12 @@ def deploy_agentic_chat_api_services(
     resolved_config = _resolve_sglang_config(config)
     router_ip, router_port = _start_router(
         config,
-        has_pd_disaggregation=resolved_config.has_pd_disaggregation,
+        has_pd_disaggregation=resolved_config.models[0].has_pd_disaggregation,
         force_new=False,
     )
-    config.sglang_router_ip = router_ip
-    config.sglang_router_port = router_port
+    if router_ip is not None:
+        config.sglang_router_ip = router_ip
+        config.sglang_router_port = router_port
 
     global _DEPLOYED_ADMISSION_COORDINATOR
 
