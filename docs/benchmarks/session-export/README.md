@@ -160,7 +160,8 @@ PYTHONPATH=. PYTHONNOUSERSITE=1 python -m pytest \
   tests/test_agentic_rollout.py tests/agentic/ -q
 ```
 
-本机结果：132 passed（分支同步上游 `9d4461d` 后重跑；原始 `668eab7` 上为 127 passed）。新增 18 个用例涵盖：
+本机常规回归结果：132 passed、1 skipped；新增 HTTP/Ray 烟测默认按需启用，显式运行结果见下节。
+新增 18 个 CPU 用例涵盖：
 
 - 同步和后台路径的全部训练字段及 trace 精确相等：隐式导出、observation 终点、多分支显式导出；普通与
   top-k / R3 / 多模态输入，包含 tokens、loss mask、logprobs、状态、reward、advantage、统计及元数据。
@@ -173,11 +174,76 @@ PYTHONPATH=. PYTHONNOUSERSITE=1 python -m pytest \
 - 人为长阻塞超过最短窗口时，所有计划短请求和 ticker 仍全部处理，防止统计口径回退。
 - 哈希仅忽略 trace 的时间事件；用户训练元数据中名为 `events` 的内容仍参与一致性校验。
 
-测试使用生产 finalizer、Forest、artifact 和 cleanup，模拟推理及已退出的 Agent 进程。
-未运行多节点 GPU 集成：该任务验证 CPU 组装与事件循环隔离，未提供远程集群或模型；上述测量不能证明
-真实模型吞吐、Ray 网络延迟或整个训练链路加速。
+以上 CPU 测试使用生产 finalizer、Forest、artifact 和 cleanup，模拟推理及已退出的 Agent 进程。
+CPU 基准中的短请求未经过 HTTP/Ray 传输；下节单独补充实际 HTTP/Ray 集成证据。
+未运行 GPU 训练或多节点集成，不能据此推断真实模型吞吐或整个训练链路加速。
 
 资源变化：每个发生过导出的 Shard 新增一个线程，默认 16 个 Shard 最多新增 16 个线程，不新增进程。
 Ray 每 Shard 的 0.25 CPU 预约未调整；这仍是调度预约而非硬 CPU 配额。GIL 限制仍存在，解码和 C 扩展长时间
 持有 GIL 时仍可能出现较短阻塞。取消与关闭采用等待有限 CPU 工作完成的策略，不强行中止 Python 线程；
 同一个已终态 Session 的请求会继续等待其导出锁。
+
+## 补充：真实 HTTP/Ray 集成烟测
+
+运行按需启用的回归用例：
+
+```bash
+RUN_AGENTIC_HTTP_RAY_SMOKE=1 PYTHONPATH=. PYTHONNOUSERSITE=1 \
+python -m pytest tests/agentic/test_session_export_http_ray.py -q
+```
+
+也可直接运行工具，保存本次结果：
+
+```bash
+PYTHONNOUSERSITE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+python -m scripts.benchmarks.smoke_session_export_http_ray \
+  --json-out /tmp/session-export-http-ray-smoke.json
+```
+
+烟测在独立子进程中启动本机 Ray：`address="local"`、唯一 namespace 与临时目录、2 个逻辑 CPU、0 GPU、
+128 MiB object store；不连接或关闭已有集群。真实 socket 客户端经 loopback TCP 访问生产
+`AgenticChatAPIService`，再通过真实 Ray RPC 进入另一个进程中的 SessionShard。
+
+仅在 Shard 构造时注入确定性的 tokenizer/compiler、推理后端和可控 Agent 进程替身。生产
+`start_group()`、首请求 barrier、`lease_group()`、chat/IR 提交、Agent watcher、finalizer、
+`take_session_results()`、drop、shutdown 与 admission coordinator 的请求 permit 管理均实际执行。
+因此本烟测验证 HTTP/Serve/Ray 调度与序列化边界，不包含真实模型推理、Agent launcher daemon 或 GPU 训练。
+
+每个变体先通过实际 HTTP 进行一次短样本预热，再通过 HTTP 提交 4 个 Session、每个 8 轮对话。
+每轮 observation 为 32 tokens、response 为 16,352 tokens，合计每条轨迹 131,072 tokens，携带 top-k 字段。
+随后同时结束这 4 个模拟 Agent，触发生产 watcher 导出；客户端按 25 ms 的计划间隔发送 40 次短聊天
+和 40 次健康请求。所有请求完成后才结束检查，延迟从计划发送时刻计算，包含排队和传输。
+
+本机显式烟测结果：**1 passed in 37.36s**。以下是该次同步/后台方案的一对观察值；每类请求 N=40，
+最近秩 P99 等于最大值。这是集成烟测，未进行重复测量，性能验收仍使用前文的重复 CPU 基准。
+
+| 指标 | 同步导出 | 后台导出 |
+|---|---:|---:|
+| 完成长轨迹导出 | 4 | 4 |
+| 每条轨迹 tokens | 131,072 | 131,072 |
+| 完成短聊天 / 健康请求 | 40 / 40 | 40 / 40 |
+| 短聊天最大延迟 ms | 1392.84 | 1100.64 |
+| 健康请求最大延迟 ms | 1290.18 | 639.40 |
+| 导出并经 Ray 取回结果耗时 s | 1.357 | 1.311 |
+| HTTP 响应完成后仍观察到终态导出 | 否 | 是 |
+
+取回的训练 payload 经真实 Ray ObjectRef 传输，在客户端重建为 Sample。逐项检查所有 tokens、rollout tokens、
+loss mask、logprobs、top-k IDs/logprobs（含 observation padding）、reward 和终态；除实际耗时及 trace
+之外的 Sample 字段在两种方案间散列一致。另检查每轮 trace 已记录 HTTP-return 事件，证明实际入口的回传标记
+路径运行过。后台方案必须至少出现一次 HTTP 已响应、Actor 中仍有 Session 处于 `FINALIZING` 的观察，
+不以请求最终返回替代并发响应证据。
+
+后台方案额外执行以下确定性交错检查，materialization gate 仅用于这些生命周期检查，不参与上表计时：
+
+- 关闭仍在等待首请求租约的真实 SSE socket，再执行 `drop_group()`。断开连接本身不被解释为后端必然已中止。
+- 使用真实 `ray.cancel()` 取消执行中的导出 RPC，确认取消向调用方传播、线程完成后才清理和发布。
+- materialization 抛错后返回 `RuntimeGroupError`，下一条轨迹仍成功导出。
+- 两个 Session 均进入终态导出、其中一个等待 worker 时执行 drop；CPU gate 尚未释放时健康请求须在 2 秒内响应，
+  drop 必须继续等待；释放 gate 后全部清理完成。
+- 在同样的执行中/排队状态下开始 shutdown，再取消该 shutdown RPC；确认清理实际完成后才转发取消，
+  已关闭 Session 随后通过 HTTP 返回 404。
+
+每个清理阶段均检查 Group、Session、IR、后端请求、模拟 Agent、permit cleanup task 和在途 permit 数量为零，
+每个 Session 的后端 close 与模拟 Agent terminate 恰好一次。关闭 Shard 后专用导出线程为零；最后对本烟测
+拥有的 Ray 子进程逐一等待退出，结果为 **0 个残留进程**。pytest 外层超时保护也只清理该子进程的后代。
+本次原始 JSON 为临时运行产物；仓库保留可复现工具、断言及此处摘要。
