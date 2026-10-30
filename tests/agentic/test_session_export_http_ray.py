@@ -62,11 +62,11 @@ def test_session_export_over_http_and_ray(tmp_path: Path) -> None:
         assert row["tokens_per_export"] == 131072
         assert row["short_requests"]["count"] == row["health_requests"]["count"] == 40
         assert all(value == 0 for value in row["cleanup"].values())
-    assert result["runs"][1]["http_while_finalizing"]
     assert result["runs"][1]["lifecycle"] == [
         "sse_disconnect_then_drop",
         "ray_export_cancel",
         "materialization_error_then_success",
         "drop_active_and_queued",
         "cancelled_shutdown_active_and_queued",
+        "http_during_gated_export",
     ]

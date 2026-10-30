@@ -214,7 +214,7 @@ python -m scripts.benchmarks.smoke_session_export_http_ray \
 随后同时结束这 4 个模拟 Agent，触发生产 watcher 导出；客户端按 25 ms 的计划间隔发送 40 次短聊天
 和 40 次健康请求。所有请求完成后才结束检查，延迟从计划发送时刻计算，包含排队和传输。
 
-本机显式烟测结果：**1 passed in 37.36s**。以下是该次同步/后台方案的一对观察值；每类请求 N=40，
+本机显式烟测结果：**1 passed in 36.25s**。以下是该次同步/后台方案的一对观察值；每类请求 N=40，
 最近秩 P99 等于最大值。这是集成烟测，未进行重复测量，性能验收仍使用前文的重复 CPU 基准。
 
 | 指标 | 同步导出 | 后台导出 |
@@ -222,26 +222,36 @@ python -m scripts.benchmarks.smoke_session_export_http_ray \
 | 完成长轨迹导出 | 4 | 4 |
 | 每条轨迹 tokens | 131,072 | 131,072 |
 | 完成短聊天 / 健康请求 | 40 / 40 | 40 / 40 |
-| 短聊天最大延迟 ms | 1392.84 | 1100.64 |
-| 健康请求最大延迟 ms | 1290.18 | 639.40 |
-| 导出并经 Ray 取回结果耗时 s | 1.357 | 1.311 |
+| 短聊天最大延迟 ms | 1268.43 | 912.10 |
+| 健康请求最大延迟 ms | 1183.67 | 533.16 |
+| 导出并经 Ray 取回结果耗时 s | 1.235 | 1.194 |
 | HTTP 响应完成后仍观察到终态导出 | 否 | 是 |
 
 取回的训练 payload 经真实 Ray ObjectRef 传输，在客户端重建为 Sample。逐项检查所有 tokens、rollout tokens、
 loss mask、logprobs、top-k IDs/logprobs（含 observation padding）、reward 和终态；除实际耗时及 trace
 之外的 Sample 字段在两种方案间散列一致。另检查每轮 trace 已记录 HTTP-return 事件，证明实际入口的回传标记
-路径运行过。后台方案必须至少出现一次 HTTP 已响应、Actor 中仍有 Session 处于 `FINALIZING` 的观察，
-不以请求最终返回替代并发响应证据。
+路径运行过。上表的自然重叠结果是可选观察值：HTTP 返回后的诊断 RPC 可能错过已经完成的导出，
+因此不作为测试通过条件。并发响应的强制检查放在下述 gate 场景中。
 
 后台方案额外执行以下确定性交错检查，materialization gate 仅用于这些生命周期检查，不参与上表计时：
 
 - 关闭仍在等待首请求租约的真实 SSE socket，再执行 `drop_group()`。断开连接本身不被解释为后端必然已中止。
-- 使用真实 `ray.cancel()` 取消执行中的导出 RPC，确认取消向调用方传播、线程完成后才清理和发布。
+- 使用真实 `ray.cancel()` 取消执行中的导出 RPC。测试 Actor 观察到目标任务的取消请求后，先让事件循环
+  处理取消唤醒；gate 仍关闭时，RPC 必须尚未结束，Session 锁、Forest 和资源仍保留，结果尚未发布且
+  close/terminate 尚未执行。释放 gate 后，再检查取消传播、正确导出及恰好一次清理。
 - materialization 抛错后返回 `RuntimeGroupError`，下一条轨迹仍成功导出。
 - 两个 Session 均进入终态导出、其中一个等待 worker 时执行 drop；CPU gate 尚未释放时健康请求须在 2 秒内响应，
   drop 必须继续等待；释放 gate 后全部清理完成。
 - 在同样的执行中/排队状态下开始 shutdown，再取消该 shutdown RPC；确认清理实际完成后才转发取消，
-  已关闭 Session 随后通过 HTTP 返回 404。
+  使用同样的 Actor 取消检查点确认 gate 释放前 RPC 和资源仍在，已关闭 Session 随后通过 HTTP 返回 404。
+
+drop 和 shutdown 场景均在实际 HTTP 健康响应完成后，再检查 gate 仍关闭且两个 Session 仍处于
+`FINALIZING`，最后才释放 gate。该确定性交错检查记录为 `http_during_gated_export`；自然负载中的
+`http_while_finalizing` 仅保留观测用途。gate 不参与性能计时，也不通过增加固定等待时间制造重叠。
+
+本轮另用测试进程中的临时变体核验断言：直接 finalizer 和 shutdown 的取消保护分别退化为普通
+`asyncio.shield()` 时，均在 gate 释放前被 RPC 提前结束断言检出；仅推迟无 gate 阶段的诊断观察时，
+自然重叠值为 false，烟测仍通过，受控 HTTP 重叠检查也通过。这些变体没有修改生产文件。
 
 每个清理阶段均检查 Group、Session、IR、后端请求、模拟 Agent、permit cleanup task 和在途 permit 数量为零，
 每个 Session 的后端 close 与模拟 Agent terminate 恰好一次。关闭 Shard 后专用导出线程为零；最后对本烟测

@@ -176,6 +176,8 @@ class SmokeShard(AgenticSessionShard.__ray_metadata__.modified_class):
         self._gate: tuple[threading.Event, threading.Event] | None = None
         self._fail_next = False
         self._materializations = 0
+        self._rpc_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._exited_rpcs: set[str] = set()
 
     async def create(self, number: int, length: int) -> tuple[str, str]:
         session_id = f"{SHARD_NAME}.session-{number}"
@@ -213,7 +215,43 @@ class SmokeShard(AgenticSessionShard.__ray_metadata__.modified_class):
         return tuple(outcomes)
 
     async def direct_export(self, session_id: str) -> None:
-        await self._finalize_terminal_session(self._session_records[session_id])
+        await self._observe_rpc("export", self._finalize_terminal_session(self._session_records[session_id]))
+
+    async def shutdown(self) -> None:
+        await self._observe_rpc("shutdown", super().shutdown())
+
+    async def _observe_rpc(self, name: str, work: Awaitable[None]) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._rpc_tasks[name] = task
+        self._exited_rpcs.discard(name)
+        try:
+            await work
+        finally:
+            self._exited_rpcs.add(name)
+
+    async def cancellation_checkpoint(self, name: str) -> dict[str, Any] | None:
+        task = self._rpc_tasks.get(name)
+        if task is None or not task.cancelling():
+            return None
+        # Task.cancel() queues its wakeup before this checkpoint yields. Let
+        # that wakeup run so an ordinary shield can expose premature return.
+        await asyncio.sleep(0)
+        return {
+            **await self.diagnostics(),
+            "rpc_done": task.done() or name in self._exited_rpcs,
+            "retained_sessions": [
+                session.session_id
+                for session in self._session_records.values()
+                if session.phase is SessionPhase.FINALIZING
+                and session.lock.locked()
+                and session.forest is not None
+                and session.resources is not None
+                and not session.result_cell.terminal
+                and session.session_id not in self._generation_backend.closed
+                and self._agent_launcher.processes[session.session_id].terminations == 0
+            ],
+        }
 
     async def arm_gate(self) -> None:
         self._gate = threading.Event(), threading.Event()
@@ -246,6 +284,7 @@ class SmokeShard(AgenticSessionShard.__ray_metadata__.modified_class):
             **snapshot,
             "pid": os.getpid(),
             "materializations": self._materializations,
+            "gate_blocked": self._gate is not None and self._gate[0].is_set() and not self._gate[1].is_set(),
             "finalizing_sessions": sum(
                 session.phase is SessionPhase.FINALIZING for session in self._session_records.values()
             ),
@@ -352,6 +391,14 @@ async def assert_empty(shard: Any, coordinator: Any, *, stopped: bool = False) -
     return state
 
 
+async def assert_cancellation_pending(shard: Any, ref: Any, name: str, session_ids: list[str]) -> None:
+    state = await until(lambda: shard.cancellation_checkpoint.remote(name), f"{name} cancellation delivery")
+    assert not state["rpc_done"], f"Cancelled {name} RPC returned before materialization finished: {state}"
+    assert state["gate_blocked"], state
+    assert set(state["retained_sessions"]) == set(session_ids), state
+    assert not ray.wait([ref], timeout=0)[0], f"Cancelled {name} RPC became ready before materialization finished"
+
+
 async def exercise(client: httpx.AsyncClient, shard: Any, coordinator: Any, mode: str) -> dict[str, Any]:
     await shard.resume_generation.remote(0)
     warmup = await prepare(client, shard, 1000, 2)
@@ -377,8 +424,8 @@ async def exercise(client: httpx.AsyncClient, shard: Any, coordinator: Any, mode
             assert len(result["choices"][0]["logprobs"]["content"]) == 2
         (health_latencies if health else short_latencies).append(time.monotonic() - due)
         if health and export_triggered.is_set() and not http_while_finalizing.is_set():
-            # Observe after the socket response completed: a terminal export
-            # must still exist, proving real HTTP overlapped materialization.
+            # Optional observation: a later diagnostics RPC can miss a fast
+            # export. Mandatory overlap checks use lifecycle gates below.
             if (await shard.diagnostics.remote())["finalizing_sessions"] > 0:
                 http_while_finalizing.set()
 
@@ -405,7 +452,6 @@ async def exercise(client: httpx.AsyncClient, shard: Any, coordinator: Any, mode
         "http_while_finalizing": http_while_finalizing.is_set(),
     }
     if mode == "thread":
-        assert result["http_while_finalizing"], "No HTTP completion observed during terminal export"
         result["lifecycle"] = await lifecycle_checks(client, shard, coordinator)
     else:
         await shard.shutdown.remote()
@@ -447,6 +493,7 @@ async def lifecycle_checks(client: httpx.AsyncClient, shard: Any, coordinator: A
     export_ref = shard.direct_export.remote(group[1])
     await until(lambda: shard.gate_started.remote(), "running export")
     ray.cancel(export_ref, force=False)
+    await assert_cancellation_pending(shard, export_ref, "export", [group[1]])
     await shard.release_gate.remote()
     try:
         await export_ref
@@ -492,8 +539,13 @@ async def lifecycle_checks(client: httpx.AsyncClient, shard: Any, coordinator: A
 
             await until(shutdown_started, "shutdown ownership")
             ray.cancel(refs[0], force=False)
+            await assert_cancellation_pending(shard, refs[0], "shutdown", [session_id for _, session_id in groups])
         response = await asyncio.wait_for(client.get("/healthz"), timeout=2)
         assert response.status_code == 200 and response.json()["ok"]
+        # The gate stays closed across the real HTTP round trip, making this
+        # overlap proof independent of export speed and diagnostics scheduling.
+        state = await shard.diagnostics.remote()
+        assert state["gate_blocked"] and state["finalizing_sessions"] == 2, state
         assert not ray.wait(refs, timeout=0)[0], "Cleanup returned while materialization was still blocked"
         await shard.release_gate.remote()
         cancellation_received = False
@@ -520,6 +572,7 @@ async def lifecycle_checks(client: httpx.AsyncClient, shard: Any, coordinator: A
         "materialization_error_then_success",
         "drop_active_and_queued",
         "cancelled_shutdown_active_and_queued",
+        "http_during_gated_export",
     ]
 
 
